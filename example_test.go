@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/natessilva/dag"
+	"github.com/ms2008/dag"
 )
 
 func ExampleRunner() {
@@ -32,10 +32,13 @@ func ExampleRunner() {
 
 	r.AddEdge("three", "four")
 
-	fmt.Printf("the runner terminated with: %v\n", r.Run())
+	_, err := r.Run()
+
+	fmt.Printf("the runner terminated with: %v\n", err)
 	// Output:
 	// one and two will run in parallel before three
 	// one and two will run in parallel before three
 	// three will run before four
-	// the runner terminated with: three is broken
+	// the runner terminated with: three: three is broken
+	// four: canceled due to dependency execute failed
 }

@@ -8,6 +8,9 @@ package dag
 
 import (
 	"errors"
+	"fmt"
+	"sort"
+	"time"
 )
 
 // Runner collects functions and arranges them as vertices and edges of a directed acyclic graph.
@@ -20,6 +23,7 @@ type Runner struct {
 
 var errMissingVertex = errors.New("missing vertex")
 var errCycleDetected = errors.New("dependency cycle detected")
+var errCanceledVertex = errors.New("canceled due to dependency execute failed")
 
 // AddVertex adds a function as a vertex in the graph. Only functions which have been added in this
 // way will be executed during Run.
@@ -40,8 +44,42 @@ func (d *Runner) AddEdge(from, to string) {
 }
 
 type result struct {
-	name string
-	err  error
+	name  string
+	err   error
+	stage int
+}
+
+type (
+	CustomError struct {
+		Group []*ErrorEntry
+	}
+
+	ErrorEntry struct {
+		Name string
+		Err  error
+	}
+)
+
+func newCustomError(errs ...*ErrorEntry) *CustomError {
+	return &CustomError{
+		Group: errs,
+	}
+}
+
+func newErrorEntry(name string, err error) *ErrorEntry {
+	return &ErrorEntry{
+		Name: name,
+		Err:  err,
+	}
+}
+
+func (e *CustomError) Error() string {
+	var msg string
+	for _, v := range e.Group {
+		msg += fmt.Sprintf("%s: %s\n", v.Name, v.Err.Error())
+	}
+
+	return msg
 }
 
 func (d *Runner) detectCycles() bool {
@@ -78,43 +116,53 @@ func (d *Runner) detectCyclesHelper(vertex string, visited, recStack map[string]
 	return false
 }
 
+// allCanceled returned all calceled vertexs
+func (d *Runner) allCanceled() []*ErrorEntry {
+	var errGroup []*ErrorEntry
+	for k := range d.fns {
+		errGroup = append(errGroup, newErrorEntry(k, errCanceledVertex))
+	}
+
+	return errGroup
+}
+
 // Run will validate that all edges in the graph point to existing vertices, and that there are
 // no dependency cycles. After validation, each vertex will be run, deterministically, in parallel
 // topological order. If any vertex returns an error, no more vertices will be scheduled and
 // Run will exit and return that error once all in-flight functions finish execution.
-func (d *Runner) Run() error {
+func (d *Runner) Run() ([]*ErrorEntry, error) {
 	// sanity check
 	if len(d.fns) == 0 {
-		return nil
+		return nil, nil
 	}
 	// count how many deps each vertex has
 	deps := make(map[string]int)
 	for vertex, edges := range d.graph {
 		// every vertex along every edge must have an associated fn
 		if _, ok := d.fns[vertex]; !ok {
-			return errMissingVertex
+			return d.allCanceled(), errMissingVertex
 		}
 		for _, vertex := range edges {
 			if _, ok := d.fns[vertex]; !ok {
-				return errMissingVertex
+				return d.allCanceled(), errMissingVertex
 			}
 			deps[vertex]++
 		}
 	}
 
 	if d.detectCycles() {
-		return errCycleDetected
+		return d.allCanceled(), errCycleDetected
 	}
 
 	running := 0
 	resc := make(chan result, len(d.fns))
-	var err error
+	var errGroup []*ErrorEntry
 
 	// start any vertex that has no deps
 	for name := range d.fns {
 		if deps[name] == 0 {
 			running++
-			start(name, d.fns[name], resc)
+			start(name, 0, d.fns[name], resc)
 		}
 	}
 
@@ -123,32 +171,99 @@ func (d *Runner) Run() error {
 		res := <-resc
 		running--
 
-		// capture the first error
-		if res.err != nil && err == nil {
-			err = res.err
+		// capture errors
+		if res.err != nil {
+			errGroup = append(errGroup, newErrorEntry(res.name, res.err))
 		}
 
-		// don't enqueue any more work on if there's been an error
-		if err != nil {
-			continue
+		// start any vertex whose deps are fully resolved
+		for _, vertex := range d.graph[res.name] {
+			if deps[vertex]--; deps[vertex] == 0 {
+				// canceled vertex
+				if res.err != nil {
+					errGroup = append(errGroup, newErrorEntry(vertex, errCanceledVertex))
+					continue
+				}
+				running++
+				start(vertex, 0, d.fns[vertex], resc)
+			}
+		}
+	}
+
+	if errGroup != nil {
+		return errGroup, newCustomError(errGroup...)
+	}
+
+	return nil, nil
+}
+
+type callback func() error
+
+// only print the topological order stack, without running it
+func (d *Runner) DryRun() [][]string {
+	running := 0
+	resc := make(chan result, len(d.fns))
+	var topStack [][]string
+
+	// count how many deps each vertex has
+	deps := make(map[string]int)
+	for _, edges := range d.graph {
+		for _, vertex := range edges {
+			deps[vertex]++
+		}
+	}
+
+	mockFn := func(n int) callback {
+		return func() error {
+			// IMPORTANT: vertices must be returned by stage order
+			time.Sleep(time.Duration(n) * time.Millisecond)
+			return nil
+		}
+	}
+
+	// start any vertex that has no deps
+	for name := range d.fns {
+		if deps[name] == 0 {
+			running++
+			start(name, 1, mockFn(0), resc)
+		}
+	}
+
+	// wait for all running work to complete
+	for running > 0 {
+		res := <-resc
+		running--
+
+		if len(topStack) < res.stage {
+			topStack = append(topStack, []string{res.name})
+		} else {
+			idx := res.stage - 1
+			topStack[idx] = append(topStack[idx], res.name)
 		}
 
 		// start any vertex whose deps are fully resolved
 		for _, vertex := range d.graph[res.name] {
 			if deps[vertex]--; deps[vertex] == 0 {
 				running++
-				start(vertex, d.fns[vertex], resc)
+				stageN := res.stage + 1
+				start(vertex, stageN, mockFn(stageN), resc)
 			}
 		}
 	}
-	return err
+
+	for _, v := range topStack {
+		sort.SliceStable(v, func(i, j int) bool { return v[i] < v[j] })
+	}
+
+	return topStack
 }
 
-func start(name string, fn func() error, resc chan<- result) {
+func start(name string, index int, fn callback, resc chan<- result) {
 	go func() {
 		resc <- result{
-			name: name,
-			err:  fn(),
+			name:  name,
+			stage: index,
+			err:   fn(),
 		}
 	}()
 }
