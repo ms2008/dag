@@ -43,6 +43,33 @@ func (d *Runner) AddEdge(from, to string) {
 	d.graph[from] = append(d.graph[from], to)
 }
 
+func (d *Runner) DelEdge(from, to string) {
+	if d.graph == nil {
+		return
+	}
+
+	edges, ok := d.graph[from]
+	if !ok {
+		return
+	}
+
+	// output index
+	i := 0
+	for _, v := range edges {
+		if v == to {
+			continue
+		}
+		// copy and increment index
+		edges[i] = v
+		i++
+	}
+
+	d.graph[from] = edges[:i]
+	if len(d.graph[from]) == 0 {
+		delete(d.graph, from)
+	}
+}
+
 type result struct {
 	name  string
 	err   error
