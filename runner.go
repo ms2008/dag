@@ -21,9 +21,11 @@ type Runner struct {
 	graph map[string][]string
 }
 
-var errMissingVertex = errors.New("missing vertex")
-var errCycleDetected = errors.New("dependency cycle detected")
-var errCanceledVertex = errors.New("canceled due to dependency execute failed")
+var (
+	errMissingVertex  = errors.New("missing vertex")
+	errCycleDetected  = errors.New("dependency cycle detected")
+	errCanceledVertex = errors.New("canceled due to dependency execute failed")
+)
 
 // AddVertex adds a function as a vertex in the graph. Only functions which have been added in this
 // way will be executed during Run.
@@ -183,6 +185,7 @@ func (d *Runner) Run() ([]*ErrorEntry, error) {
 
 	running := 0
 	resc := make(chan result, len(d.fns))
+	canceledVertex := make(map[string]bool)
 	var errGroup []*ErrorEntry
 
 	// start any vertex that has no deps
@@ -205,12 +208,15 @@ func (d *Runner) Run() ([]*ErrorEntry, error) {
 
 		// start any vertex whose deps are fully resolved
 		for _, vertex := range d.graph[res.name] {
+			// canceled vertex
+			if res.err != nil && !canceledVertex[vertex] {
+				running++
+				canceled(vertex, 0, resc)
+				canceledVertex[vertex] = true
+				continue
+			}
+
 			if deps[vertex]--; deps[vertex] == 0 {
-				// canceled vertex
-				if res.err != nil {
-					errGroup = append(errGroup, newErrorEntry(vertex, errCanceledVertex))
-					continue
-				}
 				running++
 				start(vertex, 0, d.fns[vertex], resc)
 			}
@@ -291,6 +297,16 @@ func start(name string, index int, fn callback, resc chan<- result) {
 			name:  name,
 			stage: index,
 			err:   fn(),
+		}
+	}()
+}
+
+func canceled(name string, index int, resc chan<- result) {
+	go func() {
+		resc <- result{
+			name:  name,
+			stage: index,
+			err:   errCanceledVertex,
 		}
 	}()
 }
